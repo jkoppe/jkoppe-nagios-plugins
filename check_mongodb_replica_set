@@ -1,0 +1,102 @@
+#!/usr/bin/perl -l
+use MongoDB;
+use Socket;
+# using Socket for reverse lookups
+
+my $connection;
+eval { $connection = MongoDB::Connection->new(host => "mongodb://".join(",",@ARGV), find_master => 1); };
+
+# we can't really check the replica set status if we cannot connect to the master (find_master => on the MongoDB::Connection requires that we connect to the master)
+unless ($connection) {
+    
+    # go ahead and attempt a connection to the rest of the servers, maybe this will give some more information
+    # to the responder
+    my @connected;
+    my @not_connected;
+    foreach(@ARGV) {
+        my $single_connection;
+        eval { $single_connection =  MongoDB::Connection->new(host => "mongodb://$_"); };
+        if ($single_connection) {
+            push @connected, $_;
+        } else {
+            push @not_connected, $_;
+        }
+    }
+        
+    print "CRITICAL: unable to find master (connected to: @connected / NOT connected to: @not_connected)";
+    exit 2;
+}
+
+# when find_master => 1, run is_master on all hosts
+# master ends up being the short hostname
+my $master = (split(/:/,(split(/\//,$connection->{_master}->{host}))[2]))[0];
+
+# get slave state information
+my $database = $connection->get_database("admin");
+my $status = $database->run_command({replSetGetStatus => 1});
+my $primary_time = $status->{date}->epoch;
+my %slaves;
+foreach(@{$status->{members}}) {
+	# name is the short hostname -- normalized from whatever is in the status
+	my $name = (split(/\./,(split(/:/,$_->{name}))[0]))[0];
+
+	# skip any that aren't secondaries (arbiters or self if on master)
+	next unless $_->{state} == 2;
+
+	# slaves should have health and lastHeartbeat
+	$slaves{$name}{state} = $_->{state};
+	$slaves{$name}{health} = $_->{health};
+	$slaves{$name}{lastHeartbeat} =  $_->{lastHeartbeat};
+}
+
+
+# store the slaves last operation timestamp (sec) and counter (inc)
+$database = $connection->get_database("local");
+my $cursor = $database->get_collection("slaves")->find;
+while(my $slave = $cursor->next) {
+    # slaves are listed by ip address, so reverse lookup the ip to get the hostname and grab the short hostname
+	my $hostname = (split(/\./,gethostbyaddr(inet_aton($slave->{host}),AF_INET)))[0];
+	$slaves{$hostname}{last_op_sec}=$slave->{syncedTo}->{sec};
+	$slaves{$hostname}{last_op_inc}=$slave->{syncedTo}->{inc};
+}
+
+# get the last operation from the master
+my $last_op_cursor = $database->get_collection("oplog.rs")->find->sort({'$natural' => -1})->limit(1);
+my ($last_op_sec,$last_op_inc);
+while(my $last_op = $last_op_cursor->next) {
+	$last_op_sec = $last_op->{ts}->{sec};
+	$last_op_inc = $last_op->{ts}->{inc};
+}
+
+# perfdata has some constants for the master
+my $perfdata = "'$master lag' = 0.0 '$master heartbeat_age' = 0 '$master health' = 1 '$master master' = 1";
+
+# update perfdata for each slave and unhealthy list
+my @unhealthy;
+foreach my $slave (keys %slaves) {
+	# sometimes arbiters arent skipped in the first slave loop
+	next unless $slaves{$slave}{state} == 2;
+
+	my $diff = $last_op_sec - $slaves{$slave}{last_op_sec};
+	my $opdiff = $last_op_inc - $slaves{$slave}{last_op_inc};
+	my $health = $slaves{$slave}{health};
+
+	# rs.status().date and rs.status.().members[*].lastHeartbeat are DateTime objects
+	# calculate the difference between lastHeartbeat and current primary date
+	# its possible that after a failover that lastHeartbeat won't exist for the previous primary
+	# if that's the case, what should the heartbeat_age be reported as?  zero i guess
+	my $heartbeat_age = $slaves{$slave}{lastHeartbeat} ? $status->{date}->epoch - $slaves{$slave}{lastHeartbeat}->epoch : 0;
+
+	# only trending right now, no need to compare
+	if ($health != 1) {
+		push @unhealthy, $slave;
+	}
+	$perfdata .= " '$slave lag' = $diff.$opdiff '$slave heartbeat_age' = $heartbeat_age '$slave health' = $health '$slave master' = 0";
+}
+
+if (@unhealthy) {
+	print "WARNING: not healthy (@unhealthy) | $perfdata";
+	exit 1;
+} else {
+	print "OK: healthy | $perfdata";
+}
