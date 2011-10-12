@@ -1,8 +1,11 @@
 #!/usr/bin/perl -l
 use MongoDB;
+use Data::Dumper;
 use Socket;
 # using Socket for reverse lookups
 
+# not using threshold yet
+#my $threshold = 60; 
 my $connection;
 eval { $connection = MongoDB::Connection->new(host => "mongodb://".join(",",@ARGV), find_master => 1); };
 
@@ -40,9 +43,6 @@ foreach(@{$status->{members}}) {
 	# name is the short hostname -- normalized from whatever is in the status
 	my $name = (split(/\./,(split(/:/,$_->{name}))[0]))[0];
 
-	# skip any that aren't secondaries (arbiters or self if on master)
-	next unless $_->{state} == 2;
-
 	# slaves should have health and lastHeartbeat
 	$slaves{$name}{state} = $_->{state};
 	$slaves{$name}{health} = $_->{health};
@@ -74,12 +74,15 @@ my $perfdata = "'$master lag' = 0.0 '$master heartbeat_age' = 0 '$master health'
 # update perfdata for each slave and unhealthy list
 my @unhealthy;
 foreach my $slave (keys %slaves) {
-	# sometimes arbiters arent skipped in the first slave loop
-	next unless $slaves{$slave}{state} == 2;
-
 	my $diff = $last_op_sec - $slaves{$slave}{last_op_sec};
 	my $opdiff = $last_op_inc - $slaves{$slave}{last_op_inc};
 	my $health = $slaves{$slave}{health};
+
+    # arbiters/primary don't have oplog lag, so set these to 0
+    if ($slaves{$slave}{state} != 2) {
+        $diff = 0;
+        $opdiff = 0;
+    }
 
 	# rs.status().date and rs.status.().members[*].lastHeartbeat are DateTime objects
 	# calculate the difference between lastHeartbeat and current primary date
