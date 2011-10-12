@@ -1,6 +1,5 @@
 #!/usr/bin/perl -l
 use MongoDB;
-use Data::Dumper;
 use Socket;
 # using Socket for reverse lookups
 
