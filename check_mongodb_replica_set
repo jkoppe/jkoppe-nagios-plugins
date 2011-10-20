@@ -1,10 +1,19 @@
 #!/usr/bin/perl -l
 use MongoDB;
-use Socket;
-# using Socket for reverse lookups
 
-# not using threshold yet
-#my $threshold = 60; 
+# using Socket for reverse lookups
+use Socket;
+
+# options
+use Getopt::Long;
+my $debug;
+my $result = GetOptions (
+	"debug"	=> \$debug,
+);
+if ($debug) {
+	use Data::Dumper;
+}
+
 my $connection;
 eval { $connection = MongoDB::Connection->new(host => "mongodb://".join(",",@ARGV), find_master => 1); };
 
@@ -46,6 +55,8 @@ foreach(@{$status->{members}}) {
 	$slaves{$name}{state} = $_->{state};
 	$slaves{$name}{health} = $_->{health};
 	$slaves{$name}{lastHeartbeat} =  $_->{lastHeartbeat};
+
+	$slaves{$name}{port} = (split(/:/,$_->{name}))[1];
 }
 
 
@@ -67,8 +78,33 @@ while(my $last_op = $last_op_cursor->next) {
 	$last_op_inc = $last_op->{ts}->{inc};
 }
 
+
+my %versions;
+my %version;
+my %rollback;
+# connect to each replica to:
+## discover version
+## check for rollback (if we can figure out how to 
+$version{$master}=$database->run_command({buildInfo => 1})->{version};
+#$master_dbpath = $slave_database->run_command({getCmdLineOpts  => 1})->{parsed}->{dbpath};
+foreach my $slave (keys %slaves) {
+	my $slave_connection = MongoDB::Connection->new(host => "mongodb://$slave:$slaves{$slave}{port}");
+	my $slave_database = $slave_connection->get_database("admin");
+	$version{$slave} = $slave_database->run_command({buildInfo => 1})->{version};
+	
+	# 
+	#my $slave_dbpath = $slave_database->run_command({getCmdLineOpts  => 1})->{parsed}->{dbpath};
+	#$rollback{$slave} =  $slave_database->run_command({listFiles => 1});
+	
+	$versions{$version{$slave}}++;
+}
+
+print Dumper(%versions) if $debug;
+print Dumper(%version) if $debug;
+#print Dumper(%rollback) if $debug;
+
 # perfdata has some constants for the master
-my $perfdata = "'$master lag' = 0.0 '$master heartbeat_age' = 0 '$master health' = 1 '$master master' = 1";
+my $perfdata = "'$master lag' = 0.0 '$master heartbeat_age' = 0 '$master health' = 1 '$master master' = 1 '$master version' = $version{$master}";
 
 # update perfdata for each slave and unhealthy list
 my @unhealthy;
@@ -93,7 +129,7 @@ foreach my $slave (keys %slaves) {
 	if ($health != 1) {
 		push @unhealthy, $slave;
 	}
-	$perfdata .= " '$slave lag' = $diff.$opdiff '$slave heartbeat_age' = $heartbeat_age '$slave health' = $health '$slave master' = 0";
+	$perfdata .= " '$slave lag' = $diff.$opdiff '$slave heartbeat_age' = $heartbeat_age '$slave health' = $health '$slave master' = 0 '$slave version' = $version{$slave}";
 }
 
 if (@unhealthy) {
