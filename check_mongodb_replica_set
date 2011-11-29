@@ -51,10 +51,16 @@ foreach(@{$status->{members}}) {
 	# name is the short hostname -- normalized from whatever is in the status
 	my $name = (split(/\./,(split(/:/,$_->{name}))[0]))[0];
 
+	if ($debug) {
+		print "$name";
+		print Dumper($_);
+	}
+
 	# slaves should have health and lastHeartbeat
 	$slaves{$name}{state} = $_->{state};
 	$slaves{$name}{health} = $_->{health};
 	$slaves{$name}{lastHeartbeat} =  $_->{lastHeartbeat};
+	$slaves{$name}{errmsg} =  $_->{errmsg};
 
 	$slaves{$name}{port} = (split(/:/,$_->{name}))[1];
 }
@@ -108,6 +114,7 @@ my $perfdata = "'$master lag' = 0.0 '$master heartbeat_age' = 0 '$master health'
 
 # update perfdata for each slave and unhealthy list
 my @unhealthy;
+my %slave_unhealthy_reasons;
 foreach my $slave (keys %slaves) {
 	my $diff = $last_op_sec - $slaves{$slave}{last_op_sec};
 	my $opdiff = $last_op_inc - $slaves{$slave}{last_op_inc};
@@ -119,6 +126,10 @@ foreach my $slave (keys %slaves) {
         $opdiff = 0;
     }
 
+	if ($slaves{$slave}{errmsg}) {
+		push @{$slave_unhealthy_reasons{$slave}}, "errmsg = $slaves{$slave}{errmsg}";
+	}
+
 	# rs.status().date and rs.status.().members[*].lastHeartbeat are DateTime objects
 	# calculate the difference between lastHeartbeat and current primary date
 	# its possible that after a failover that lastHeartbeat won't exist for the previous primary
@@ -127,13 +138,24 @@ foreach my $slave (keys %slaves) {
 
 	# only trending right now, no need to compare
 	if ($health != 1) {
-		push @unhealthy, $slave;
+		push @{$slave_unhealthy_reasons{$slave}}, "health != 1";
 	}
 	$perfdata .= " '$slave lag' = $diff.$opdiff '$slave heartbeat_age' = $heartbeat_age '$slave health' = $health '$slave master' = 0 '$slave version' = $version{$slave}";
+
+	if ($slave_unhealthy_reasons{$slave}) {
+		push @unhealthy, $slave;
+	}
 }
 
 if (@unhealthy) {
-	print "WARNING: not healthy (@unhealthy) | $perfdata";
+	print "WARNING: not healthy (@unhealthy) | $perfdata\n";
+
+	foreach my $slave (@unhealthy) {
+		print "$slave:";
+		foreach my $reason (@{$slave_unhealthy_reasons{$slave}}) {
+			print "\t$reason";
+		}
+	}
 	exit 1;
 } else {
 	print "OK: healthy | $perfdata";
